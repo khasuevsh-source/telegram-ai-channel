@@ -10,8 +10,8 @@ CAPTION="$4"
 
 if [ -n "$IMAGE_PATH" ] && [ -f "$IMAGE_PATH" ]; then
   curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto" \
-    -F "chat_id=${CHANNEL_ID}" \
-    -F "caption=${CAPTION}" \
+    --form-string "chat_id=${CHANNEL_ID}" \
+    --form-string "caption=${CAPTION}" \
     -F "photo=@${IMAGE_PATH}"
 else
   curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
