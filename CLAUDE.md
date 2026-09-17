@@ -54,7 +54,8 @@
 3. Проверить тему по posted-log.md — если похожая была недавно, взять другую.
 4. Написать пост по шаблону рубрики (см. CONTENT_PLAN.md), 600–1000 знаков,
    с эмодзи-разметкой по стилю канала.
-5. Сгенерировать картинку: `python3 scripts/generate-card.py "короткий заголовок поста" /tmp/post.png`
+5. Сгенерировать картинку (Accent — из таблицы рубрик в CONTENT_PLAN.md):
+   `python3 scripts/generate-card.py "короткий заголовок поста" /tmp/post.png "НАЗВАНИЕ РУБРИКИ" "#accent"`
    (нужен Pillow — `pip install pillow`, если не установлен).
    Опубликовать: `./scripts/send-telegram-post.sh "$BOT_TOKEN" "$CHANNEL_ID" /tmp/post.png "текст поста"`.
    Если генерация картинки почему-то не удалась — не блокироваться, публиковать
