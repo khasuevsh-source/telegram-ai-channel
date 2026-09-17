@@ -1,1 +1,3 @@
 config/config.json
+config/github_token.txt
+config/gemini_key.txt
