@@ -39,7 +39,7 @@ caption = text if len(text) <= 1024 else ""
 with CARD.open("rb") as photo:
     response = requests.post(
         f"{api}/sendPhoto",
-        data={"chat_id": channel, "caption": caption},
+        data={"chat_id": channel, "caption": caption, "parse_mode": "HTML"},
         files={"photo": photo},
         timeout=60,
     )
