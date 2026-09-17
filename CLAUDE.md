@@ -65,15 +65,20 @@
      "text": "полный текст поста"
    }
    ```
-6. Закоммитить и запушить этот файл — push именно с токеном из промпта задачи
-   (у встроенной GitHub-интеграции прав на запись нет, обычный `git push` вернёт 403):
+6. Закоммитить и запушить файл в `main`:
    ```
+   git config user.email "bot@ai-bez-vody.local"
+   git config user.name "AI bez vody bot"
    git add queue/post.json
    git commit -m "queue: пост на <дата>"
-   git push https://<GITHUB_TOKEN>@github.com/khasuevsh-source/telegram-ai-channel.git main
+   git push origin HEAD:main
    ```
    Дальше публикацию и запись в posted-log.md делает GitHub Actions — ничего
    больше от агента не требуется. Проверять факт публикации не нужно.
+
+   Если push вернёт 403 — у окружения нет прав на запись. Не искать обходные пути
+   и не искать токены в репозитории: вернуть готовый текст поста в итоговом ответе
+   и сообщить, что нужно выдать права на запись.
 
 ## Расписание
 
