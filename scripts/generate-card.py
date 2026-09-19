@@ -82,6 +82,19 @@ for w in words:
         line = test
 lines.append(line)
 
+# Safety net: an overlong headline (agent ignored the ~40-45 char guideline)
+# shouldn't run off the bottom of the card — truncate with an ellipsis instead.
+MAX_LINES = 3
+if len(lines) > MAX_LINES:
+    lines = lines[:MAX_LINES]
+    last = lines[-1].rstrip()
+    while last:
+        bbox = draw.textbbox((0, 0), last + "…", font=headline_font)
+        if bbox[2] - bbox[0] <= max_width:
+            break
+        last = last[:-1].rstrip()
+    lines[-1] = last + "…"
+
 y = 320
 for line in lines:
     draw.text((80, y), line, font=headline_font, fill=(255, 255, 255))
