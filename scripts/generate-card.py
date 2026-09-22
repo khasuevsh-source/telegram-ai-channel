@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Usage: generate-card.py "headline text" out.png ["RUBRIC LABEL"] ["#accentHex"]"""
+"""Usage: generate-card.py "headline text" out.png ["RUBRIC LABEL"] ["#accentHex"] [background.png]
+
+With a background image (e.g. from Gemini) the brand glows are replaced by that image
+under a dark overlay; badge, headline and logo are drawn on top the same way.
+"""
 import math
 import sys
 
@@ -9,6 +13,7 @@ headline = sys.argv[1]
 out_file = sys.argv[2]
 rubric_label = sys.argv[3] if len(sys.argv) > 3 else "AI БЕЗ ВОДЫ"
 accent_hex = sys.argv[4] if len(sys.argv) > 4 else "#8B5CF6"
+background = sys.argv[5] if len(sys.argv) > 5 else None
 
 
 def hex_to_rgb(h):
@@ -49,13 +54,27 @@ def load_font(size):
     return ImageFont.load_default()
 
 
-img = Image.new("RGBA", (W, H), (*BASE, 255))
-add_glow(img, 160, 180, 460, VIOLET)
-add_glow(img, 900, 260, 400, ACCENT)
-add_glow(img, 250, 950, 420, TEAL)
+if background:
+    src = Image.open(background).convert("RGBA")
+    scale = max(W / src.width, H / src.height)
+    src = src.resize((round(src.width * scale), round(src.height * scale)), Image.LANCZOS)
+    left, top = (src.width - W) // 2, (src.height - H) // 2
+    img = src.crop((left, top, left + W, top + H))
+    # darker band where the badge and headline sit, lighter elsewhere
+    shade = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    sdraw = ImageDraw.Draw(shade)
+    for y_ in range(H):
+        alpha = 185 if 60 <= y_ <= 640 else 120
+        sdraw.line([(0, y_), (W, y_)], fill=(*BASE, alpha))
+    img.alpha_composite(shade)
+else:
+    img = Image.new("RGBA", (W, H), (*BASE, 255))
+    add_glow(img, 160, 180, 460, VIOLET)
+    add_glow(img, 900, 260, 400, ACCENT)
+    add_glow(img, 250, 950, 420, TEAL)
 
-overlay = Image.new("RGBA", img.size, (*BASE, 60))
-img.alpha_composite(overlay)
+    overlay = Image.new("RGBA", img.size, (*BASE, 60))
+    img.alpha_composite(overlay)
 
 draw = ImageDraw.Draw(img)
 tag_font = load_font(32)
