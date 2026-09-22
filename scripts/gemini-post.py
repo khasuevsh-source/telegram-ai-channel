@@ -53,6 +53,8 @@ FEEDS = [
     ("Google News", news_query("нейросеть OR «искусственный интеллект» OR ChatGPT when:7d", "ru")),
     ("Google News", news_query("AI model OR chatbot OR OpenAI OR Anthropic OR Gemini OR DeepSeek when:7d", "en")),
     ("TechCrunch", "https://techcrunch.com/category/artificial-intelligence/feed/"),
+    ("VentureBeat", "https://venturebeat.com/category/ai/feed/"),
+    ("Ars Technica", "https://arstechnica.com/ai/feed/"),
     ("The Verge", "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml"),
     ("OpenAI", "https://openai.com/news/rss.xml"),
     ("Google", "https://blog.google/technology/ai/rss/"),
@@ -150,8 +152,11 @@ def fetch_news(max_age_days):
         try:
             resp = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0 (ai-bez-vody bot)"})
             root = ET.fromstring(resp.content)
-        except (requests.RequestException, ET.ParseError) as err:
+        except requests.RequestException as err:
             print(f"лента {source}: не загрузилась ({err.__class__.__name__})")
+            continue
+        except ET.ParseError:
+            print(f"лента {source}: не RSS (HTTP {resp.status_code}, {resp.headers.get('Content-Type', '?')})")
             continue
         entries = root.iter("item") if root.find(".//item") is not None else root.iter("{http://www.w3.org/2005/Atom}entry")
         feed_items = []
