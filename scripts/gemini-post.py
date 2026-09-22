@@ -125,6 +125,7 @@ def first_working(model_list, body):
             return model, gemini(model, body)
         except RuntimeError as err:
             errors.append(str(err))
+            print("пропускаю:", err)
     raise SystemExit("ни одна модель Gemini не ответила:\n" + "\n".join(errors))
 
 
@@ -240,7 +241,8 @@ def parse_json(raw):
     block = re.search(r"```json\s*(\{.*?\})\s*```", raw, re.S) or re.search(r"(\{.*\})", raw, re.S)
     if not block:
         raise ValueError("в ответе нет JSON")
-    return json.loads(block.group(1))
+    # strict=False: модели часто ставят настоящие переносы строк внутри строковых значений
+    return json.loads(block.group(1), strict=False)
 
 
 def write_post(news):
