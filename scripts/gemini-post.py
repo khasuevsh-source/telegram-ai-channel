@@ -20,6 +20,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 
@@ -36,9 +37,9 @@ def models(env, default):
     return [m.strip() for m in os.environ.get(env, default).split(",") if m.strip()]
 
 
-TEXT_MODELS = models(
-    "GEMINI_TEXT_MODELS", "gemini-3.8-flash,gemini-3.7-flash,gemini-3.5-flash-lite,gemini-3.1-flash-lite"
-)
+# Запасной список на случай, если список моделей не получить. Обычно порядок строит
+# pick_text_models(): самая новая Flash первой, lite — только последним резервом.
+FALLBACK_TEXT_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 # Пусто по умолчанию: картинок в бесплатном тарифе нет. После подключения оплаты в Google
 # вписать сюда, например, "gemini-3.1-flash-image,gemini-2.5-flash-image".
 IMAGE_MODELS = models("GEMINI_IMAGE_MODELS", "")
@@ -94,16 +95,49 @@ label, emoji, accent, rubric_tag, rubric_desc = RUBRICS[today.weekday()]
 is_news = label == "НОВОСТИ НЕДЕЛИ"
 
 
+def pick_text_models():
+    """Самая новая Flash первой, затем остальные Flash, затем lite — всё из того, что доступно ключу."""
+    if os.environ.get("GEMINI_TEXT_MODELS"):
+        return models("GEMINI_TEXT_MODELS", "")
+    try:
+        listing = requests.get(f"{GEMINI}?pageSize=200", headers={"x-goog-api-key": api_key}, timeout=60)
+        listing.raise_for_status()
+        names = [m["name"].split("/")[-1] for m in listing.json().get("models", [])
+                 if "generateContent" in m.get("supportedGenerationMethods", [])]
+    except (requests.RequestException, ValueError) as err:
+        print(f"список моделей не получен ({err.__class__.__name__}), беру запасной")
+        return FALLBACK_TEXT_MODELS
+
+    def by_version(pattern):
+        found = [(tuple(int(x) for x in m.group(1).split(".")), m.group(0))
+                 for m in (re.fullmatch(pattern, n) for n in names) if m]
+        return [name for _, name in sorted(found, reverse=True)]
+
+    ordered = by_version(r"gemini-(\d+(?:\.\d+)*)-flash") + by_version(r"gemini-(\d+(?:\.\d+)*)-flash-lite")
+    return ordered or FALLBACK_TEXT_MODELS
+
+
 def gemini(model, body):
-    response = requests.post(
-        f"{GEMINI}/{model}:generateContent",
-        headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-        json=body,
-        timeout=240,
-    )
-    if response.status_code != 200:
-        raise RuntimeError(f"{model}: HTTP {response.status_code}: {describe_error(response)}")
-    return response.json()
+    for attempt in range(3):
+        response = requests.post(
+            f"{GEMINI}/{model}:generateContent",
+            headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+            json=body,
+            timeout=240,
+        )
+        if response.status_code == 200:
+            return response.json()
+        reason = describe_error(response)
+        # временный сбой или поминутный лимит — ждём и повторяем ту же модель; дневной лимит
+        # за минуты не восстановится, тогда сразу к следующей модели
+        transient = response.status_code in (500, 502, 503, 504) or (
+            response.status_code == 429 and "PerMinute" in reason and "PerDay" not in reason
+        )
+        if not transient or attempt == 2:
+            raise RuntimeError(f"{model}: HTTP {response.status_code}: {reason}")
+        wait = 60 if response.status_code == 429 else 20 * (attempt + 1)
+        print(f"{model}: HTTP {response.status_code}, повтор через {wait} с")
+        time.sleep(wait)
 
 
 def describe_error(response):
@@ -264,9 +298,11 @@ def write_post(news):
     contents = [{"role": "user", "parts": [{"text": task}]}]
     system = {"parts": [{"text": PROMPT.read_text(encoding="utf-8")}]}
 
+    text_models = pick_text_models()
+    print("порядок моделей:", ", ".join(text_models))
     for attempt in range(3):
         model, resp = first_working(
-            TEXT_MODELS,
+            text_models,
             {"systemInstruction": system, "contents": contents, "generationConfig": {"temperature": 0.7}},
         )
         raw = "".join(p.get("text", "") for p in resp["candidates"][0]["content"]["parts"])
@@ -280,6 +316,7 @@ def write_post(news):
         if not issues:
             post["sources"] = [{"url": news[s - 1]["link"], "date": news[s - 1]["date"], "outlet": news[s - 1]["outlet"]}
                                for s in post.get("sources", [])]
+            post["model"] = model
             return post
         contents += [
             {"role": "model", "parts": [{"text": raw}]},
@@ -358,6 +395,7 @@ ARCHIVE.mkdir(exist_ok=True)
             "headline": post["headline"],
             "text": post["text"],
             "sources": post["sources"],
+            "model": post["model"],
             "message_id": message_id,
         },
         ensure_ascii=False,
