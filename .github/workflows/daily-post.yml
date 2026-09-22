@@ -1,0 +1,60 @@
+name: Daily post (Gemini)
+
+on:
+  schedule:
+    - cron: '0 16 * * *'   # 19:00 МСК
+  push:
+    paths:
+      - 'trigger/daily-post'   # ручной запуск коммитом; "dry" в файле — без публикации
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Только сгенерировать, в канал не отправлять'
+        type: boolean
+        default: false
+
+concurrency:
+  group: daily-post
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install pillow requests
+
+      - name: Generate and publish
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: '@ai_bez_vody_ru'
+        run: |
+          if [ "${{ github.event_name }}" = "push" ] && grep -qi dry trigger/daily-post; then export DRY_RUN=1; fi
+          if [ "${{ inputs.dry_run }}" = "true" ]; then export DRY_RUN=1; fi
+          python scripts/gemini-post.py
+
+      - name: Upload card
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: card
+          path: /tmp/card.png
+          if-no-files-found: ignore
+
+      - name: Commit log and archive
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add posted-log.md archive
+          git diff --staged --quiet || git commit -m "daily post: $(date -u +%F)"
+          git pull --rebase origin main
+          git push
