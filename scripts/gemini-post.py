@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""Ежедневный пост целиком на Gemini: поиск повода, текст, иллюстрация, публикация.
+"""Ежедневный пост целиком на Gemini: свежие новости из RSS, текст, публикация.
 
 Запускается из GitHub Actions по расписанию (.github/workflows/daily-post.yml) и токены
 Claude не тратит. Правила для модели — в prompts/gemini-post.md, прошлые посты для
 дедупликации — в archive/.
+
+Почему RSS, а не поиск Google внутри Gemini: у бесплатного тарифа квота на поиск и на
+генерацию картинок нулевая (проверено 2026-09-22, HTTP 429 RESOURCE_EXHAUSTED). Ленты
+к тому же дают точную дату публикации — старое за новое модель подать не сможет.
 """
 import base64
 import datetime
+import email.utils
 import html
 import json
 import os
@@ -15,6 +20,8 @@ import re
 import subprocess
 import sys
 import tempfile
+import urllib.parse
+import xml.etree.ElementTree as ET
 
 import requests
 
@@ -32,7 +39,26 @@ def models(env, default):
 TEXT_MODELS = models(
     "GEMINI_TEXT_MODELS", "gemini-3.8-flash,gemini-3.7-flash,gemini-3.5-flash-lite,gemini-3.1-flash-lite"
 )
-IMAGE_MODELS = models("GEMINI_IMAGE_MODELS", "gemini-3.1-flash-image,gemini-2.5-flash-image")
+# Пусто по умолчанию: картинок в бесплатном тарифе нет. После подключения оплаты в Google
+# вписать сюда, например, "gemini-3.1-flash-image,gemini-2.5-flash-image".
+IMAGE_MODELS = models("GEMINI_IMAGE_MODELS", "")
+
+
+def news_query(q, lang):
+    region = {"ru": "hl=ru&gl=RU&ceid=RU:ru", "en": "hl=en-US&gl=US&ceid=US:en"}[lang]
+    return f"https://news.google.com/rss/search?q={urllib.parse.quote(q)}&{region}"
+
+
+FEEDS = [
+    ("Google News", news_query("нейросеть OR «искусственный интеллект» OR ChatGPT when:7d", "ru")),
+    ("Google News", news_query("AI model OR chatbot OR OpenAI OR Anthropic OR Gemini OR DeepSeek when:7d", "en")),
+    ("TechCrunch", "https://techcrunch.com/category/artificial-intelligence/feed/"),
+    ("The Verge", "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml"),
+    ("OpenAI", "https://openai.com/news/rss.xml"),
+    ("Google", "https://blog.google/technology/ai/rss/"),
+    ("Hugging Face", "https://huggingface.co/blog/feed.xml"),
+    ("Хабр", "https://habr.com/ru/rss/hub/artificial_intelligence/all/"),
+]
 
 RUBRICS = {
     0: ("НОВОСТИ НЕДЕЛИ", "🗞", "#22D3EE", "#новости", "главные релизы и обновления AI за последние 7 дней, 2–4 пункта"),
@@ -51,14 +77,19 @@ IMAGE_STYLE = (
 )
 MAX_LEN = 1024
 ALLOWED_TAGS = ("b", "i", "code")
+PER_FEED = 8
 
 api_key = os.environ["GEMINI_API_KEY"]
-bot_token = os.environ["TELEGRAM_BOT_TOKEN"]
+bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 channel = os.environ["TELEGRAM_CHANNEL_ID"]
 dry_run = os.environ.get("DRY_RUN", "").lower() in ("1", "true", "yes")
+if not dry_run and not bot_token:
+    raise SystemExit("секрет TELEGRAM_BOT_TOKEN пустой — добавьте его в Settings → Secrets → Actions")
 
-today = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=3))).date()
+now = datetime.datetime.now(datetime.timezone.utc)
+today = now.astimezone(datetime.timezone(datetime.timedelta(hours=3))).date()
 label, emoji, accent, rubric_tag, rubric_desc = RUBRICS[today.weekday()]
+is_news = label == "НОВОСТИ НЕДЕЛИ"
 
 
 def gemini(model, body):
@@ -81,37 +112,83 @@ def describe_error(response):
     reasons = [error.get("status", "")]
     for detail in error.get("details", []):
         for violation in detail.get("violations", []):
-            reasons.append(f"{violation.get('quotaId', '')} limit={violation.get('quotaValue', '?')}")
+            reasons.append(violation.get("quotaId", ""))
     return " | ".join(r for r in reasons if r) or error.get("message", "")[:300]
 
 
-def diagnose():
-    listing = requests.get(f"{GEMINI}?pageSize=200", headers={"x-goog-api-key": api_key}, timeout=60)
-    print(f"список моделей: HTTP {listing.status_code}")
-    if listing.ok:
-        names = [m["name"].split("/")[-1] for m in listing.json().get("models", [])
-                 if "generateContent" in m.get("supportedGenerationMethods", [])]
-        print("  доступны:", ", ".join(n for n in names if "flash" in n or "image" in n))
-    probe = {"contents": [{"parts": [{"text": "Ответь одним словом: ок"}]}]}
-    for model in TEXT_MODELS + IMAGE_MODELS:
-        for label_, extra in (("без поиска", {}), ("с поиском", {"tools": [{"google_search": {}}]})):
-            if model in IMAGE_MODELS and extra:
-                continue
-            try:
-                gemini(model, {**probe, **extra})
-                print(f"  {model} {label_}: OK")
-            except RuntimeError as err:
-                print(f"  {label_}: {err}")
-
-
-def first_working(model_list, body_for):
+def first_working(model_list, body):
     errors = []
     for model in model_list:
         try:
-            return model, gemini(model, body_for(model))
+            return model, gemini(model, body)
         except RuntimeError as err:
             errors.append(str(err))
     raise SystemExit("ни одна модель Gemini не ответила:\n" + "\n".join(errors))
+
+
+def parse_date(value):
+    if not value:
+        return None
+    try:
+        parsed = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        try:
+            parsed = datetime.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=datetime.timezone.utc)
+
+
+def clean(text, limit):
+    text = html.unescape(re.sub(r"<[^>]+>", " ", text or ""))
+    return re.sub(r"\s+", " ", text).strip()[:limit]
+
+
+def fetch_news(max_age_days):
+    items, seen = [], set()
+    for source, url in FEEDS:
+        try:
+            resp = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0 (ai-bez-vody bot)"})
+            root = ET.fromstring(resp.content)
+        except (requests.RequestException, ET.ParseError) as err:
+            print(f"лента {source}: не загрузилась ({err.__class__.__name__})")
+            continue
+        entries = root.iter("item") if root.find(".//item") is not None else root.iter("{http://www.w3.org/2005/Atom}entry")
+        feed_items = []
+        for entry in entries:
+            def field(*names):
+                for name in names:
+                    node = entry.find(name)
+                    if node is not None:
+                        return node.get("href") if name.endswith("link") and node.get("href") else (node.text or "")
+                return ""
+
+            atom = "{http://www.w3.org/2005/Atom}"
+            title = clean(field("title", f"{atom}title"), 200)
+            published = parse_date(field("pubDate", f"{atom}published", f"{atom}updated"))
+            if not title or not published or (now - published).days > max_age_days:
+                continue
+            key = re.sub(r"\W+", "", title.lower())[:60]
+            if key in seen:
+                continue
+            seen.add(key)
+            outlet = source
+            if source == "Google News" and " - " in title:
+                title, outlet = title.rsplit(" - ", 1)
+            feed_items.append({
+                "title": title,
+                "outlet": outlet,
+                "date": published.date().isoformat(),
+                "summary": clean(field("description", f"{atom}summary", f"{atom}content"), 240),
+                "link": field("link", f"{atom}link"),
+            })
+        # не больше 8 с ленты: иначе поток региональных заметок из Google News
+        # вытесняет профильные издания
+        feed_items.sort(key=lambda i: i["date"], reverse=True)
+        items += feed_items[:PER_FEED]
+        print(f"лента {source}: {len(feed_items)} свежих, берём {min(len(feed_items), PER_FEED)}")
+    items.sort(key=lambda i: i["date"], reverse=True)
+    return items
 
 
 def recent_posts(limit=14):
@@ -132,7 +209,7 @@ def sanitize(text):
     return re.sub(r"\n{3,}", "\n\n", "".join(out)).strip()
 
 
-def problems(post, grounded):
+def problems(post, news):
     found = []
     text = post.get("text", "")
     if len(text) > MAX_LEN:
@@ -146,8 +223,11 @@ def problems(post, grounded):
             found.append(f"незакрытый тег <{tag}>")
     if not post.get("headline") or len(post["headline"]) > 50:
         found.append("headline пустой или длиннее 45 знаков")
-    if label == "НОВОСТИ НЕДЕЛИ" and not grounded:
-        found.append("для новостей обязателен поиск в Google — найди события за последние 7 дней")
+    sources = post.get("sources", [])
+    if any(not isinstance(s, int) or not 1 <= s <= len(news) for s in sources):
+        found.append(f"sources — только номера материалов из списка, от 1 до {len(news)}")
+    elif is_news and not sources:
+        found.append("для новостей укажи в sources номера материалов из списка, на которых основан пост")
     return found
 
 
@@ -158,16 +238,21 @@ def parse_json(raw):
     return json.loads(block.group(1))
 
 
-def write_post():
+def write_post(news):
     history = "\n\n".join(
         f"[{p['date']} · {p['rubric']}] {re.sub(r'<[^>]+>', '', p['text'])}" for p in recent_posts()
     ) or "постов пока нет"
+    materials = "\n".join(
+        f"{n}. [{i['date']} · {i['outlet']}] {i['title']}" + (f" — {i['summary']}" if i["summary"] else "")
+        for n, i in enumerate(news, 1)
+    ) or "свежих материалов нет"
     task = (
         f"Сегодня {today.isoformat()}, {WEEKDAYS[today.weekday()]}.\n"
         f"Рубрика: {emoji} {label} — {rubric_desc}.\n"
         f"Хештег рубрики: {rubric_tag}.\n\n"
+        f"Свежие материалы (номер, дата публикации, издание, заголовок):\n{materials}\n\n"
         f"Прошлые посты — не повторяй их продукты и события:\n{history}\n\n"
-        "Найди повод через поиск и напиши пост по правилам."
+        "Напиши пост по правилам."
     )
     contents = [{"role": "user", "parts": [{"text": task}]}]
     system = {"parts": [{"text": PROMPT.read_text(encoding="utf-8")}]}
@@ -175,24 +260,19 @@ def write_post():
     for attempt in range(3):
         model, resp = first_working(
             TEXT_MODELS,
-            lambda m: {
-                "systemInstruction": system,
-                "contents": contents,
-                "tools": [{"google_search": {}}],
-                "generationConfig": {"temperature": 0.7},
-            },
+            {"systemInstruction": system, "contents": contents, "generationConfig": {"temperature": 0.7}},
         )
-        candidate = resp["candidates"][0]
-        raw = "".join(p.get("text", "") for p in candidate["content"]["parts"])
-        grounded = bool(candidate.get("groundingMetadata", {}).get("groundingChunks"))
+        raw = "".join(p.get("text", "") for p in resp["candidates"][0]["content"]["parts"])
         try:
             post = parse_json(raw)
             post["text"] = sanitize(post.get("text", ""))
-            issues = problems(post, grounded)
+            issues = problems(post, news)
         except (ValueError, json.JSONDecodeError) as err:
             post, issues = None, [f"ответ не разобрался как JSON: {err}"]
         print(f"попытка {attempt + 1} ({model}): {'ок' if not issues else '; '.join(issues)}")
         if not issues:
+            post["sources"] = [{"url": news[s - 1]["link"], "date": news[s - 1]["date"], "outlet": news[s - 1]["outlet"]}
+                               for s in post.get("sources", [])]
             return post
         contents += [
             {"role": "model", "parts": [{"text": raw}]},
@@ -202,41 +282,40 @@ def write_post():
 
 
 def draw_image(prompt, out):
-    def body(model, with_ratio=True):
-        config = {"responseModalities": ["IMAGE"]}
-        if with_ratio:
-            config["imageConfig"] = {"aspectRatio": "1:1"}
-        return {"contents": [{"parts": [{"text": f"{prompt}\n\n{IMAGE_STYLE}"}]}], "generationConfig": config}
-
     for model in IMAGE_MODELS:
-        for with_ratio in (True, False):
-            try:
-                resp = gemini(model, body(model, with_ratio))
-            except RuntimeError as err:
-                print("картинка:", err)
-                continue
-            for part in resp.get("candidates", [{}])[0].get("content", {}).get("parts", []):
-                data = part.get("inlineData") or part.get("inline_data")
-                if data:
-                    out.write_bytes(base64.b64decode(data["data"]))
-                    print(f"картинка: {model}")
-                    return True
+        body = {
+            "contents": [{"parts": [{"text": f"{prompt}\n\n{IMAGE_STYLE}"}]}],
+            "generationConfig": {"responseModalities": ["IMAGE"], "imageConfig": {"aspectRatio": "1:1"}},
+        }
+        try:
+            resp = gemini(model, body)
+        except RuntimeError as err:
+            print("картинка:", err)
+            continue
+        for part in resp.get("candidates", [{}])[0].get("content", {}).get("parts", []):
+            data = part.get("inlineData") or part.get("inline_data")
+            if data:
+                out.write_bytes(base64.b64decode(data["data"]))
+                print(f"картинка: {model}")
+                return True
     return False
 
 
-if dry_run:
-    diagnose()
-post = write_post()
+news = fetch_news(7 if is_news else 14)
+print(f"материалов в работу: {len(news)}")
+if is_news and len(news) < 3:
+    raise SystemExit("свежих новостей почти нет — лучше пропустить день, чем пересказывать старое")
+
+post = write_post(news)
 tmp = pathlib.Path(tempfile.gettempdir())
 background, card = tmp / "gemini-bg.png", tmp / "card.png"
 card_args = [sys.executable, str(ROOT / "scripts" / "generate-card.py"), post["headline"], str(card), label, accent]
-if draw_image(post.get("image_prompt", post["headline"]), background):
+if IMAGE_MODELS and draw_image(post.get("image_prompt", post["headline"]), background):
     card_args.append(str(background))
-else:
-    print("картинка от Gemini не получилась — рисую фирменную карточку без неё")
 subprocess.run(card_args, check=True)
 
 print("\n" + post["text"] + "\n")
+print("источники:", json.dumps(post["sources"], ensure_ascii=False))
 if dry_run:
     print("DRY_RUN: в канал не отправляю")
     sys.exit(0)
@@ -271,7 +350,7 @@ ARCHIVE.mkdir(exist_ok=True)
             "rubric": label,
             "headline": post["headline"],
             "text": post["text"],
-            "sources": post.get("sources", []),
+            "sources": post["sources"],
             "message_id": message_id,
         },
         ensure_ascii=False,
