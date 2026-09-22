@@ -29,7 +29,9 @@ def models(env, default):
     return [m.strip() for m in os.environ.get(env, default).split(",") if m.strip()]
 
 
-TEXT_MODELS = models("GEMINI_TEXT_MODELS", "gemini-3.8-flash,gemini-3.7-flash,gemini-2.5-flash")
+TEXT_MODELS = models(
+    "GEMINI_TEXT_MODELS", "gemini-3.8-flash,gemini-3.7-flash,gemini-3.5-flash-lite,gemini-3.1-flash-lite"
+)
 IMAGE_MODELS = models("GEMINI_IMAGE_MODELS", "gemini-3.1-flash-image,gemini-2.5-flash-image")
 
 RUBRICS = {
@@ -67,8 +69,39 @@ def gemini(model, body):
         timeout=240,
     )
     if response.status_code != 200:
-        raise RuntimeError(f"{model}: HTTP {response.status_code}: {response.text[:300]}")
+        raise RuntimeError(f"{model}: HTTP {response.status_code}: {describe_error(response)}")
     return response.json()
+
+
+def describe_error(response):
+    try:
+        error = response.json()["error"]
+    except (ValueError, KeyError):
+        return response.text[:500]
+    reasons = [error.get("status", "")]
+    for detail in error.get("details", []):
+        for violation in detail.get("violations", []):
+            reasons.append(f"{violation.get('quotaId', '')} limit={violation.get('quotaValue', '?')}")
+    return " | ".join(r for r in reasons if r) or error.get("message", "")[:300]
+
+
+def diagnose():
+    listing = requests.get(f"{GEMINI}?pageSize=200", headers={"x-goog-api-key": api_key}, timeout=60)
+    print(f"список моделей: HTTP {listing.status_code}")
+    if listing.ok:
+        names = [m["name"].split("/")[-1] for m in listing.json().get("models", [])
+                 if "generateContent" in m.get("supportedGenerationMethods", [])]
+        print("  доступны:", ", ".join(n for n in names if "flash" in n or "image" in n))
+    probe = {"contents": [{"parts": [{"text": "Ответь одним словом: ок"}]}]}
+    for model in TEXT_MODELS + IMAGE_MODELS:
+        for label_, extra in (("без поиска", {}), ("с поиском", {"tools": [{"google_search": {}}]})):
+            if model in IMAGE_MODELS and extra:
+                continue
+            try:
+                gemini(model, {**probe, **extra})
+                print(f"  {model} {label_}: OK")
+            except RuntimeError as err:
+                print(f"  {label_}: {err}")
 
 
 def first_working(model_list, body_for):
@@ -191,6 +224,8 @@ def draw_image(prompt, out):
     return False
 
 
+if dry_run:
+    diagnose()
 post = write_post()
 tmp = pathlib.Path(tempfile.gettempdir())
 background, card = tmp / "gemini-bg.png", tmp / "card.png"
