@@ -117,27 +117,30 @@ def pick_text_models():
     return ordered or FALLBACK_TEXT_MODELS
 
 
+class Busy(RuntimeError):
+    """Модель временно недоступна (перегрузка или поминутный лимит) — стоит повторить позже."""
+
+
 def gemini(model, body):
-    for attempt in range(3):
+    try:
         response = requests.post(
             f"{GEMINI}/{model}:generateContent",
             headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
             json=body,
             timeout=240,
         )
-        if response.status_code == 200:
-            return response.json()
-        reason = describe_error(response)
-        # временный сбой или поминутный лимит — ждём и повторяем ту же модель; дневной лимит
-        # за минуты не восстановится, тогда сразу к следующей модели
-        transient = response.status_code in (500, 502, 503, 504) or (
-            response.status_code == 429 and "PerMinute" in reason and "PerDay" not in reason
-        )
-        if not transient or attempt == 2:
-            raise RuntimeError(f"{model}: HTTP {response.status_code}: {reason}")
-        wait = 60 if response.status_code == 429 else 20 * (attempt + 1)
-        print(f"{model}: HTTP {response.status_code}, повтор через {wait} с")
-        time.sleep(wait)
+    except requests.RequestException as err:
+        raise Busy(f"{model}: сеть: {err.__class__.__name__}") from err
+    if response.status_code == 200:
+        return response.json()
+    reason = describe_error(response)
+    message = f"{model}: HTTP {response.status_code}: {reason}"
+    # дневной лимит за минуты не восстановится — это не Busy, модель выбывает до завтра
+    if response.status_code in (500, 502, 503, 504) or (
+        response.status_code == 429 and "PerMinute" in reason and "PerDay" not in reason
+    ):
+        raise Busy(message)
+    raise RuntimeError(message)
 
 
 def describe_error(response):
@@ -152,14 +155,42 @@ def describe_error(response):
     return " | ".join(r for r in reasons if r) or error.get("message", "")[:300]
 
 
+PATIENCE_SECONDS = 20 * 60
+
+
 def first_working(model_list, body):
+    """Сначала — полноценные Flash по кругу, пока не истечёт PATIENCE_SECONDS; lite — только потом.
+
+    В пиковые часы (19:00 МСК — утро в США) бесплатные Flash-модели по несколько минут
+    отвечают 503 все разом (инцидент 2026-09-23: за 4 минуты ни одна не ответила, пост
+    написала lite). Поэтому ждём с нарастающими паузами, а не сдаёмся после пары попыток.
+    """
+    full = [m for m in model_list if "-lite" not in m]
+    reserve = [m for m in model_list if "-lite" in m]
+    deadline = time.monotonic() + PATIENCE_SECONDS
+    pause = 30
+    while full:
+        for model in list(full):
+            try:
+                return model, gemini(model, body)
+            except Busy as err:
+                print("занята:", err)
+            except RuntimeError as err:
+                print("выбывает:", err)
+                full.remove(model)
+        if not full or time.monotonic() + pause > deadline:
+            break
+        print(f"все Flash заняты, жду {pause} с")
+        time.sleep(pause)
+        pause = min(pause * 2, 240)
+    print("полноценные Flash не ответили — беру резервную lite")
     errors = []
-    for model in model_list:
+    for model in reserve:
         try:
             return model, gemini(model, body)
         except RuntimeError as err:
             errors.append(str(err))
-            print("пропускаю:", err)
+            print("резерв:", err)
     raise SystemExit("ни одна модель Gemini не ответила:\n" + "\n".join(errors))
 
 
