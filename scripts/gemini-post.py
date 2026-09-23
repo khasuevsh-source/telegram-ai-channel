@@ -79,7 +79,7 @@ IMAGE_STYLE = (
     "Absolutely no text, letters, numbers, logos or watermarks in the image."
 )
 MAX_LEN = 1024
-ALLOWED_TAGS = ("b", "i", "code")
+ALLOWED_TAGS = ("b", "i", "code", "pre")
 PER_FEED = 8
 
 api_key = os.environ["GEMINI_API_KEY"]
